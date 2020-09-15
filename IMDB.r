@@ -4,30 +4,26 @@
 
 library(tidyverse)
 library(bestglm)
+library(dplyr)
+library(DataExplorer)
 
 ## Read in Data
-imdb <- read_csv("/Users/graceedriggs/Documents/Stat 495/IMDB/imdb495/IMDBTrain.csv")
-imdb.test <- read_csv("/Users/graceedriggs/Documents/Stat 495/IMDB/imdb495/IMDBTest.csv")
+imdb.train <- read_csv("/Users/graceedriggs/Documents/Stat 495/IMDB/imdbusmovies/IMDBTrain.csv")
+imdb.test <- read_csv("/Users/graceedriggs/Documents/Stat 495/IMDB/imdbusmovies/IMDBTest.csv")
 
-##
-## Exploratory Data Analysis
-##
+## Merge the two datasets together so when I clean the
+## training dataset I also treat the test set the same way
+names(imdb.test)[names(imdb.test)=="Id"] <- "movie_title"
+imdb <- bind_rows(train=imdb.train, test=imdb.test, .id="Set")
+
+###############################
+## Exploratory Data Analysis ##
+###############################
 
 ## Overall summary of the Data
 summary(imdb)
 
-
-# get rid of all NA's
-imdb.deleted.all <- na.omit(imdb) 
-    ## results in 3294 variables. so 1200 rows were deleted.
-
-## Getting rid of NA's
-delete.na <- function(DF, n=0) {
-  DF[rowSums(is.na(DF)) <= n,]
-}
-imdb.deleted <- delete.na(imdb, 2)
-    ## results in 4135 variables. So only 300 rows were deleted.
-
+sum(is.na(imdb$imdb_score))
 
 ## Scatterplot of Budget vs. Score
 ## Uh-oh... budget is in local currency.. need to convert to common.
@@ -42,19 +38,156 @@ ggplot(data=imdb, mapping = aes(x=gross, y=imdb_score)) +
 with(imdb, cor(gross, imdb_score, use="complete.obs"))
 cor(imdb$gross, imdb$imdb_score, use="complete.obs")
 
-## Regression Model
-imdb.lm <- lm(imdb_score ~ color + director_name + num_critic_for_reviews + duration, data = imdb )
-summary(imdb.lm)
 
-##### Best Subsets method ######
-best.subsets.bic <- bestglm(imdb,
-                            IC = "BIC",
-                            method = "exhaustive",
-                            TopModels = 10)
+#####################
+### clean up data ###
+#####################
 
-best.subsets.bic.df <- data.frame("num.vars" = 1:dim(imdb.lm)[2], 
-                                  "BIC" = best.subsets.bic$Subsets$BIC)
+## Duration - only one missing so just look it up and fill it in
+# imdb[is.na(imdb$duration),]$duration <- 116 #or
+imdb <- imdb %>%
+  mutate(duration=replace(duration, is.na(duration), 116))
 
+## Color - mode imputation and convert to 0/1
+#imdb$color[is.na(imdb$color)] <- "Color"
+imdb <- imdb %>% 
+  mutate(color=replace(color, is.na(color), "Color"))
+imdb <- imdb %>%
+  mutate(color = ifelse(color == "Color", 1, 0))
 
-## explore the first 4 collumns. clean up data. etc. (color, director name, num_critics for reviees, duration)
-## install git on computer.
+## num_user_for_reviews = mean imputation
+imdb <- imdb %>%
+  mutate(num_user_for_reviews=replace(num_user_for_reviews, is.na(num_user_for_reviews), 
+                                      mean(num_user_for_reviews, na.rm=TRUE)))
+
+## Director - convert to number of movies made by director
+director_movie_count <- imdb %>%
+  group_by(director_name) %>%
+  summarise(movies_made = n())
+
+imdb <- imdb %>%
+  left_join(director_movie_count) %>%
+  select(-director_name)
+
+## Median imputation for num_critic_for_reviews
+# imdb[is.na(imdb[["num_critic_for_reviews"]]), "num_critic_for_reviews"] <-
+#   median(x = imdb[["num_critic_for_reviews"]], na.rm = TRUE)
+imdb <- imdb %>% 
+  mutate(num_critic_for_reviews=replace(num_critic_for_reviews,
+                                        is.na(num_critic_for_reviews),
+                                        median(num_critic_for_reviews, na.rm=TRUE)))
+
+## Language - only five missing values so we replace them and then 
+# we will have a indicator variable for each language
+# Replace values for missing languages 
+## Language - only five missing values so we replace them
+missing_languages <- c("English", "None", "None", "None", "None")
+#imdb$language[is.na(imdb$language)] <- missing_languages  ## or
+imdb <- imdb %>% 
+  mutate(language=replace(language, is.na(language), missing_languages))
+
+## Lots of very small categories for language so combine into English vs. Non-English
+imdb <- imdb %>%
+  mutate(language=fct_collapse(language, Other=unique(language[language!="English"])))
+table(imdb$language) 
+
+## Genres - get the main genre
+## Content-rating - collapse GP --> PG and create "other"
+## X --> NC-17, TV-?? --> TV, M-->PG13
+imdb <- imdb %>%
+  mutate(content_rating=fct_explicit_na(content_rating, na_level = "Unknown")) %>%
+  mutate(content_rating=fct_collapse(content_rating, PG=c("GP", "PG"),
+                                     NC17=c("X", "NC-17"),
+                                     TV=c("TV-14", "TV-G", "TV-PG"),
+                                     PG13=c("PG-13","M")))
+table(imdb$content_rating)
+
+## Genres - get the main genre and number of genres assigned
+imdb <- imdb %>% mutate(main_genre=(str_split(genres, "\\|") %>%
+                                      sapply(., FUN=function(x){x[1]})),
+                                    num_genre=(str_split(genres, "\\|") %>%
+                                  sapply(., FUN=length)))
+table(imdb$main_genre) 
+#Some genres only have 1 movie so create "other" category
+#that contains all categories with less than 10 movies
+other.cat <- names(table(imdb$main_genre))[table(imdb$main_genre)<10]
+other.cat <- imdb %>% group_by(main_genre) %>% 
+  summarize(n=n()) %>% filter(n<10) %>% pull(main_genre)
+imdb <- imdb %>%
+  mutate(main_genre=fct_collapse(main_genre, Other=other.cat))
+
+# Budget and Gross -
+# There is a somewhat strong correlation between budget and gross, so we will
+# impute the budget first since budget has fewer missing values and then
+# imput the budget to predict the gross
+# impute the budget first since budget has fewer missing values and then use the
+# imputed the budget to predict the gross
+
+## Option 1
+## LM for Budget using only full data
+budget.lm <- lm(sqrt(budget)~num_critic_for_reviews+duration+num_voted_users+
+                  cast_total_facebook_likes+title_year+
+                  movie_facebook_likes+main_genre, data=imdb)
+budget.preds <- (predict(budget.lm, newdata=(imdb %>% filter(is.na(budget)))))^2
+imdb <- imdb %>%
+  mutate(budget=replace(budget, is.na(budget), budget.preds))
+
+## Option 2
+## Stochastic reg imputation for gross
+# Makes it so you dont over-inflate your correlation for gross. It fills in random data with
+# the correct variance.
+gross.lm <- lm(sqrt(gross)~num_critic_for_reviews+duration+num_voted_users+
+                 cast_total_facebook_likes+title_year+
+                 movie_facebook_likes+main_genre+budget, data=imdb)
+gross.preds <- (predict(gross.lm, newdata=(imdb %>% filter(is.na(gross))))+
+                  rnorm(sum(is.na(imdb$gross)), 0, sigma(gross.lm)))^2
+imdb <- imdb %>%
+  mutate(gross=replace(gross, is.na(gross), gross.preds))
+# clear up space
+rm(list=c("gross.lm", "budget.lm"))
+                
+## actor_name columns - we created num_top_actors which tell us 
+## how many “top” actors were in a movie. “Top” actors were actors who 
+## were in multiple movies. All 3 actor column were used to decide who was a top actor.
+all.actors <- imdb %>% select(actor_1_name, actor_2_name, actor_3_name) %>% do.call(c, args=.)
+actors.freq <- data.frame(actor=all.actors) %>% filter(!is.na(actor)) %>%
+     group_by(actor) %>% summarize(n=n()) %>%
+     arrange(desc(n))
+     top.actors <- actors.freq %>% filter(n>10) %>% pull(actor)
+imdb <- imdb %>%
+      mutate(num_top_actors=(ifelse(actor_1_name%in%top.actors, 1, 0) +
+                                           ifelse(actor_2_name%in%top.actors, 1, 0) +
+                                           ifelse(actor_3_name%in%top.actors, 1, 0)))
+                              ## essentially counts the number of top actors up to 3.
+                
+ ## facebook_like columns -  we made a column num_pop_actors for the total number of popular actors 
+## in a movie based off of their Facebook likes. With this, we decided to throw 
+## out cast_facebook likes as it seemed repetitive. It’s pretty mute since there’s 
+## also actor Facebook likes
+actor.likes <- imdb %>% select(actor_1_facebook_likes, actor_2_facebook_likes, actor_3_facebook_likes) %>%
+                  do.call(c, args=.)
+                actors.likes <- data.frame(actor=all.actors, likes=actor.likes) %>%
+                  filter(!is.na(actor)) %>% group_by(actor) %>% summarize(likes=max(likes)) %>%
+                  arrange(desc(likes))
+                pop.actors <- actors.likes %>% filter(likes>quantile(likes, probs=0.99)) %>%
+                  pull(actor)
+                imdb <- imdb %>%
+                  mutate(num_top_actors=(ifelse(actor_1_name%in%pop.actors, 1, 0) +
+                                           ifelse(actor_2_name%in%pop.actors, 1, 0) +
+                                           ifelse(actor_3_name%in%pop.actors, 1, 0)))
+                
+## movie_facebook_likes - we believe it to be unreliable. 
+## It seems that some of the movies with 0s in the data have more 
+## likes than top movies in real life. Although, there are no NAs 
+## so not much cleaning to do there. We were considering throwing it out
+                
+ ## I am going to throw out any variable we didn't use/clean
+imdb <- imdb %>% select(-cast_total_facebook_likes, -movie_imdb_link, -facenumber_in_poster,
+                                        -plot_keywords, -country, -movie_facebook_likes, -director_facebook_likes,
+                                        -actor_1_name, -actor_2_name, -actor_3_name, -actor_1_facebook_likes,
+                                        -actor_2_facebook_likes, -actor_3_facebook_likes, -genres, 
+                                        -cast_total_facebook_likes)
+                plot_missing(imdb)
+### end up clean up data ###
+              
+
